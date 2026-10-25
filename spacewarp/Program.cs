@@ -12,6 +12,9 @@
 // itself, which also means screenshots and screen recordings don't show it.
 // It lives in the tray.
 //
+// Flags:
+//   --preset high|medium|low   use this preset for this run (the tray menu's choice is saved)
+//
 // Debugging flags:
 //   --dump <folder>   save each ring's latest frame there
 //   --stats <file>    log frames drawn per second
@@ -37,7 +40,7 @@ namespace TerminalSpaceWarp;
 // Everything that shapes the effect. Sizes are in DIPs (1/96 inch).
 static class Lens
 {
-    public const float RingWidth = 56f;      // how far out from the window space bends
+    public const float RingWidth = 56f;      // how far out from the window space bends (Low uses less)
     public const float Pull = 0.45f;         // 0..0.5: how hard light bends; 0.5 stretches the edge without limit
     public const float Swirl = 0.30f;        // frame dragging along the edge; same spin as the terminal shader
     public const float Dispersion = 0.12f;   // red bends a little less than blue
@@ -47,10 +50,43 @@ static class Lens
     public const float WindowCorner = 8f;    // Windows 11's rounded window corners
 }
 
+// How much CPU and GPU the warp may use, picked from the tray menu.
+//   High   - redraws every display refresh and never idles, so changes behind
+//            the ring show up instantly (the always-on renderer).
+//   Medium - redraws only when a terminal moves or the desktop under a ring
+//            changes, and idles otherwise (the dirty-rect renderer). Recommended.
+//   Low    - like Medium, but at most 30 redraws a second, a narrower ring,
+//            no colour split and a slower idle check.
+sealed record Preset(string Key, string Label, float RingWidth, float Dispersion,
+                     bool RedrawEveryFrame, int MinFrameMs, uint IdlePollMs)
+{
+    public static readonly Preset High = new("high", "High performance", Lens.RingWidth, Lens.Dispersion, true, 0, 0);
+    public static readonly Preset Medium = new("medium", "Medium performance (recommended)", Lens.RingWidth, Lens.Dispersion, false, 0, 100);
+    public static readonly Preset Low = new("low", "Low performance", 40f, 0f, false, 33, 250);
+    public static readonly Preset[] All = [High, Medium, Low];
+
+    const string Key_ = @"Software\TerminalSpaceWarp";
+
+    public static Preset Find(string? key) => All.FirstOrDefault(p => p.Key == key?.ToLowerInvariant()) ?? Medium;
+
+    public static Preset Load()
+    {
+        using var key = Registry.CurrentUser.OpenSubKey(Key_);
+        return Find(key?.GetValue("Preset") as string);
+    }
+
+    public void Save()
+    {
+        using var key = Registry.CurrentUser.CreateSubKey(Key_);
+        key.SetValue("Preset", Key);
+    }
+}
+
 static class Program
 {
     public static string? DumpFolder, StatsFile;
     public static bool TestPattern;
+    public static Preset StartPreset = Preset.Medium;
 
     [STAThread]
     static void Main(string[] args)
@@ -64,6 +100,7 @@ static class Program
             DumpFolder = Directory.CreateDirectory(dump).FullName;
         StatsFile = Arg("--stats");
         TestPattern = args.Contains("--test-pattern");
+        StartPreset = Arg("--preset") is string preset ? Preset.Find(preset) : Preset.Load();
 
         using var mutex = new Mutex(true, "TerminalSpaceWarp.SingleInstance", out var first);
         if (!first)
@@ -90,6 +127,23 @@ sealed class TrayContext : ApplicationContext
         pause.Click += (_, _) => { renderer.Paused = !renderer.Paused; pause.Checked = renderer.Paused; };
         var startup = new ToolStripMenuItem("Start with Windows") { Checked = StartsWithWindows() };
         startup.Click += (_, _) => { SetStartsWithWindows(!startup.Checked); startup.Checked = StartsWithWindows(); };
+
+        renderer.Preset = Program.StartPreset;
+        var performance = new ToolStripMenuItem("Performance");
+        foreach (var preset in Preset.All)
+        {
+            var item = new ToolStripMenuItem(preset.Label) { Checked = preset == renderer.Preset };
+            item.Click += (_, _) =>
+            {
+                renderer.Preset = preset;
+                preset.Save();
+                foreach (ToolStripMenuItem other in performance.DropDownItems)
+                    other.Checked = other == item;
+            };
+            performance.DropDownItems.Add(item);
+        }
+
+        menu.Items.Add(performance);
         menu.Items.Add(pause);
         menu.Items.Add(startup);
         menu.Items.Add(new ToolStripSeparator());
@@ -144,6 +198,7 @@ sealed class Renderer
     const string TerminalClass = "CASCADIA_HOSTING_WINDOW_CLASS";
 
     public volatile bool Paused;
+    public volatile Preset Preset = Preset.Medium;
     volatile bool stopping;
     Thread? thread;
 
@@ -223,12 +278,13 @@ sealed class Renderer
                     continue;
                 }
 
+                var preset = Preset;
                 foreach (var desktop in gpu.Desktops)
                     desktop.Refresh(gpu);
                 var ringAreas = rings.Values.Where(r => r.Visible).Select(r => r.Area).ToHashSet();
                 foreach (var ring in rings.Values)
                 {
-                    if (ring.Frame(gpu, ringAreas))
+                    if (ring.Frame(gpu, ringAreas, preset, now))
                     {
                         frames++;
                         lastDraw = now;
@@ -242,16 +298,17 @@ sealed class Renderer
                     frames = 0;
                 }
 
-                // Busy (drew in the last half second): one pass per display refresh.
-                // Idle: look again in 100 ms, or as soon as a terminal moves.
-                if (now - lastDraw < 500)
+                // Busy (drew in the last half second, or the preset never idles): one
+                // pass per display refresh. Idle: look again after the preset's poll
+                // interval, or as soon as a terminal moves.
+                if (preset.RedrawEveryFrame || now - lastDraw < 500)
                 {
                     if (Native.DwmFlush() != 0)
                         Thread.Sleep(8);
                 }
                 else
                 {
-                    Native.WaitForMessages(100);
+                    Native.WaitForMessages(preset.IdlePollMs);
                 }
             }
         }
@@ -538,7 +595,7 @@ sealed class Ring : NativeWindow, IDisposable
     int width, height;
     Native.RECT lastRect;
     bool visible;
-    long lastDump;
+    long lastDump, lastFrame;
 
     public Ring(Gpu gpu, IntPtr terminal)
     {
@@ -561,12 +618,13 @@ sealed class Ring : NativeWindow, IDisposable
         target.SetRoot(visual);
     }
 
-    // Moves and redraws the ring if the window moved, or if the desktop changed
-    // somewhere under the ring. Returns true if it drew.
     public bool Visible => visible;
     public Native.RECT Area { get; private set; }
 
-    public bool Frame(Gpu gpu, HashSet<Native.RECT> ringAreas)
+    // Moves and redraws the ring if the window moved or the desktop changed
+    // somewhere under the ring (or every frame, if the preset says so), no more
+    // often than the preset allows. Returns true if it drew.
+    public bool Frame(Gpu gpu, HashSet<Native.RECT> ringAreas, Preset preset, long now)
     {
         var desktop = gpu.DesktopFor(terminal);
         if (desktop?.View == null || !ShouldShow(out var rect))
@@ -576,15 +634,19 @@ sealed class Ring : NativeWindow, IDisposable
         }
 
         float scale = Native.GetDpiForWindow(terminal) / 96f;
-        int margin = (int)MathF.Ceiling(Lens.RingWidth * scale);
+        int margin = (int)MathF.Ceiling(preset.RingWidth * scale);
         int left = rect.Left - margin, top = rect.Top - margin;
         int w = rect.Right - rect.Left + 2 * margin, h = rect.Bottom - rect.Top + 2 * margin;
 
         // The ring only ever samples the desktop inside its own bounds.
         var area = new Native.RECT { Left = left, Top = top, Right = left + w, Bottom = top + h };
-        bool moved = !rect.Equals(lastRect);
-        if (!moved && visible && !desktop.ChangedNear(area, rect, ringAreas))
-            return false;        lastRect = rect;
+        bool changed = !rect.Equals(lastRect) || !area.Equals(Area) || !visible || preset.RedrawEveryFrame
+                    || desktop.ChangedNear(area, rect, ringAreas);
+        // A skipped frame leaves lastRect stale, so the move is drawn once the interval is up.
+        if (!changed || now - lastFrame < preset.MinFrameMs)
+            return false;
+        lastRect = rect;
+        lastFrame = now;
         Area = area;
 
         if (w != width || h != height)
@@ -602,6 +664,7 @@ sealed class Ring : NativeWindow, IDisposable
             Scale = scale,
             Radius = Lens.WindowCorner * scale,
             TestPattern = Program.TestPattern ? 1 : 0,
+            Dispersion = preset.Dispersion,
         };
         var mapped = ctx.Map(gpu.Constants, 0, MapMode.WriteDiscard);
         unsafe { Unsafe.Write((void*)mapped.DataPointer, p); }
@@ -733,7 +796,8 @@ static class Shader
         public float Scale;                     // DPI scale
         public float Radius;                    // window corner radius in pixels
         public float TestPattern;
-        public System.Numerics.Vector2 Pad;
+        public float Dispersion;                // colour split; 0 samples once instead of three times
+        public float Pad;
     }
 
     static string F(float value) => value.ToString("0.0####", CultureInfo.InvariantCulture);
@@ -741,7 +805,6 @@ static class Shader
     public static string Source() => $$"""
         #define PULL {{F(Lens.Pull)}}
         #define SWIRL {{F(Lens.Swirl)}}
-        #define DISPERSION {{F(Lens.Dispersion)}}
         #define SHADOW {{F(Lens.Shadow)}}
         #define PHOTON_RING {{F(Lens.PhotonRing)}}
         #define PHOTON_RING_AT {{F(Lens.PhotonRingAt)}}
@@ -755,7 +818,8 @@ static class Shader
             float  Scale;
             float  Radius;
             float  TestPattern;
-            float2 Pad;
+            float  Dispersion;
+            float  Pad;
         };
 
         Texture2D Desktop : register(t0);
@@ -803,9 +867,11 @@ static class Shader
             float t = 1.0 - u;
             float2 base = pos.xy + float2(-n.y, n.x) * (SWIRL * Margin * t * t);
             float2 push = n * (PULL * Margin * t * t);
-            float3 c = float3(Tap(base + push * (1.0 - DISPERSION)).r,
-                              Tap(base + push).g,
-                              Tap(base + push * (1.0 + DISPERSION)).b);
+            float3 c = Dispersion > 0.0
+                ? float3(Tap(base + push * (1.0 - Dispersion)).r,
+                         Tap(base + push).g,
+                         Tap(base + push * (1.0 + Dispersion)).b)
+                : Tap(base + push);
 
             c *= 1.0 - SHADOW * t * t * t;
             float ring = (u - PHOTON_RING_AT) * Margin / (1.5 * Scale);

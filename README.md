@@ -63,17 +63,32 @@ dotnet build -c Release spacewarp
 .\spacewarp\bin\Release\net10.0-windows\TerminalSpaceWarp.exe
 ```
 
-It lives in the tray: **Pause**, **Start with Windows**, **Exit**. The lens settings are the
-`Lens` constants at the top of [`Program.cs`](spacewarp/Program.cs); rebuild after changing them.
+It lives in the tray: **Performance**, **Pause**, **Start with Windows**, **Exit**. The lens
+settings are the `Lens` constants at the top of [`Program.cs`](spacewarp/Program.cs); rebuild
+after changing them.
+
+### Performance presets
+
+Pick one from the tray's **Performance** menu; the choice is remembered. For a single run,
+pass `--preset high`, `--preset medium` or `--preset low`.
+
+| Preset | What it does | CPU, terminal sitting still | Redraws while dragging |
+|---|---|---|---|
+| **High performance** | Redraws every display refresh and never idles, so changes behind the ring appear instantly | ~0.9% | every refresh |
+| **Medium performance** (recommended) | Redraws only when a terminal moves or the desktop under its ring changes; idles otherwise | ~0.15% | every move |
+| **Low performance** | Like Medium, but at most 30 redraws a second, a narrower ring, no colour split and a slower idle check | ~0.15% | up to 30/s |
+
+Measured on a 16-thread laptop at 144 Hz. At idle Low is about the same as Medium, since
+both are asleep; it saves CPU and GPU while dragging or when something animates behind
+the ring.
 
 Things to know:
 
 - The ring is excluded from screen capture, or it would capture and re-lens its own
   output. That means screenshots and screen recordings don't show it.
 - It hides itself when a terminal is maximized, fullscreen or minimized.
-- It only redraws when a terminal moves or the desktop under a ring changes (it reads
-  the capture's dirty rects), so a terminal sitting still costs about 0.15% CPU, and
-  about 0.01% with no terminal on screen.
+- With no terminal on screen it checks only twice a second (about 0.01% CPU), whatever
+  the preset.
 - Windows only hands over the previous desktop frame, so a very fast drag can briefly
   smear the terminal onto the trailing edge.
 - Debug flags: `--test-pattern` (a flat magenta ring screenshots can see),

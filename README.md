@@ -71,6 +71,9 @@ Things to know:
 - The ring is excluded from screen capture, or it would capture and re-lens its own
   output. That means screenshots and screen recordings don't show it.
 - It hides itself when a terminal is maximized, fullscreen or minimized.
+- It only redraws when a terminal moves or the desktop under a ring changes (it reads
+  the capture's dirty rects), so a terminal sitting still costs about 0.15% CPU, and
+  about 0.01% with no terminal on screen.
 - Windows only hands over the previous desktop frame, so a very fast drag can briefly
   smear the terminal onto the trailing edge.
 - Debug flags: `--test-pattern` (a flat magenta ring screenshots can see),

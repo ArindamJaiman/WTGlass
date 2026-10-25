@@ -23,6 +23,7 @@ using System.Globalization;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using Microsoft.Win32;
+using Vortice;
 using Vortice.D3DCompiler;
 using Vortice.Direct3D;
 using Vortice.Direct3D11;
@@ -180,8 +181,18 @@ sealed class Renderer
     void Loop(Gpu gpu)
     {
         var rings = new Dictionary<IntPtr, Ring>();
-        long lastScan = 0, statsStart = Environment.TickCount64;
+        long lastScan = 0, lastDraw = 0, statsStart = Environment.TickCount64;
         int frames = 0;
+
+        // Wakes the loop the moment a terminal starts moving, so an idle loop
+        // can wait on its message queue instead of running every refresh.
+        Native.WinEventProc onMove = (_, _, hwnd, idObject, _, _, _) =>
+        {
+            if (idObject == Native.OBJID_WINDOW && rings.ContainsKey(hwnd))
+                lastDraw = Environment.TickCount64;
+        };
+        IntPtr hook = Native.SetWinEventHook(Native.EVENT_OBJECT_LOCATIONCHANGE, Native.EVENT_OBJECT_LOCATIONCHANGE,
+            IntPtr.Zero, onMove, 0, 0, Native.WINEVENT_OUTOFCONTEXT | Native.WINEVENT_SKIPOWNPROCESS);
         try
         {
             while (!stopping)
@@ -212,10 +223,17 @@ sealed class Renderer
                     continue;
                 }
 
-                bool desktopChanged = gpu.Desktops.Aggregate(false, (any, d) => d.Refresh(gpu) | any);
+                foreach (var desktop in gpu.Desktops)
+                    desktop.Refresh(gpu);
+                var ringAreas = rings.Values.Where(r => r.Visible).Select(r => r.Area).ToHashSet();
                 foreach (var ring in rings.Values)
-                    if (ring.Frame(gpu, desktopChanged))
+                {
+                    if (ring.Frame(gpu, ringAreas))
+                    {
                         frames++;
+                        lastDraw = now;
+                    }
+                }
 
                 if (Program.StatsFile != null && now - statsStart >= 1000)
                 {
@@ -224,13 +242,23 @@ sealed class Renderer
                     frames = 0;
                 }
 
-                // Sleep until DWM composes the next frame: one pass per refresh.
-                if (Native.DwmFlush() != 0)
-                    Thread.Sleep(8);
+                // Busy (drew in the last half second): one pass per display refresh.
+                // Idle: look again in 100 ms, or as soon as a terminal moves.
+                if (now - lastDraw < 500)
+                {
+                    if (Native.DwmFlush() != 0)
+                        Thread.Sleep(8);
+                }
+                else
+                {
+                    Native.WaitForMessages(100);
+                }
             }
         }
         finally
         {
+            Native.UnhookWinEvent(hook);
+            GC.KeepAlive(onMove);
             foreach (var ring in rings.Values)
                 ring.Dispose();
         }
@@ -346,6 +374,12 @@ sealed class Desktop : IDisposable
     public readonly Native.RECT Bounds;
     public uint Width, Height;
 
+    // What changed in the latest frame, in screen coordinates.
+    readonly List<Native.RECT> changed = new();
+    bool allChanged;
+    RawRect[] dirtyRects = [];
+    OutduplMoveRect[] moveRects = [];
+
     public Desktop(Gpu gpu, IDXGIOutput1 output)
     {
         this.output = output;
@@ -379,6 +413,8 @@ sealed class Desktop : IDisposable
     // Takes the newest desktop frame if there is one. True if the picture changed.
     public bool Refresh(Gpu gpu)
     {
+        changed.Clear();
+        allChanged = false;
         if (duplication == null)
         {
             Duplicate(gpu);
@@ -408,7 +444,9 @@ sealed class Desktop : IDisposable
                 View = gpu.Device.CreateShaderResourceView(copy);
                 Width = desc.Width;
                 Height = desc.Height;
+                allChanged = true;
             }
+            CollectChanges(info.TotalMetadataBufferSize);
             gpu.Context.CopyResource(copy, texture);
             return true;
         }
@@ -417,6 +455,66 @@ sealed class Desktop : IDisposable
             resource.Dispose();
             duplication.ReleaseFrame();
         }
+    }
+
+    // Reads the frame's dirty and move rects. If they're unavailable, treat the
+    // whole monitor as changed.
+    void CollectChanges(uint metadataSize)
+    {
+        if (metadataSize == 0)
+        {
+            allChanged = true;
+            return;
+        }
+
+        int maxMoves = (int)(metadataSize / Unsafe.SizeOf<OutduplMoveRect>()) + 1;
+        if (moveRects.Length < maxMoves)
+            moveRects = new OutduplMoveRect[maxMoves];
+        if (duplication!.GetFrameMoveRects((uint)(moveRects.Length * Unsafe.SizeOf<OutduplMoveRect>()), moveRects, out uint moveBytes).Failure)
+        {
+            allChanged = true;
+            return;
+        }
+        for (int i = 0; i < moveBytes / Unsafe.SizeOf<OutduplMoveRect>(); i++)
+            Add(moveRects[i].DestinationRect);
+
+        int maxDirty = (int)(metadataSize / Unsafe.SizeOf<RawRect>()) + 1;
+        if (dirtyRects.Length < maxDirty)
+            dirtyRects = new RawRect[maxDirty];
+        if (duplication.GetFrameDirtyRects((uint)(dirtyRects.Length * Unsafe.SizeOf<RawRect>()), dirtyRects, out uint dirtyBytes).Failure)
+        {
+            allChanged = true;
+            return;
+        }
+        for (int i = 0; i < dirtyBytes / Unsafe.SizeOf<RawRect>(); i++)
+            Add(dirtyRects[i]);
+    }
+
+    void Add(RawRect r) => changed.Add(new Native.RECT
+    {
+        Left = r.Left + Bounds.Left,
+        Top = r.Top + Bounds.Top,
+        Right = r.Right + Bounds.Left,
+        Bottom = r.Bottom + Bounds.Top,
+    });
+
+    // True if the latest frame changed anything inside `area` that isn't
+    // entirely inside `ignore` (the terminal itself: its text doesn't affect the ring).
+    // A ring's own present is reported as a change exactly the size of its
+    // window even though the ring is excluded from capture; those are skipped,
+    // or every ring would wake itself up every frame.
+    public bool ChangedNear(Native.RECT area, Native.RECT ignore, HashSet<Native.RECT> rings)
+    {
+        if (allChanged)
+            return true;
+        foreach (var c in changed)
+        {
+            bool overlaps = c.Left < area.Right && c.Right > area.Left && c.Top < area.Bottom && c.Bottom > area.Top;
+            bool insideTerminal = c.Left >= ignore.Left && c.Right <= ignore.Right && c.Top >= ignore.Top && c.Bottom <= ignore.Bottom;
+            if (overlaps && !insideTerminal && !rings.Contains(c))
+                return true;
+        }
+        return false;
     }
 
     public void Dispose()
@@ -463,9 +561,12 @@ sealed class Ring : NativeWindow, IDisposable
         target.SetRoot(visual);
     }
 
-    // Moves and redraws the ring if the window moved or the desktop changed.
-    // Returns true if it drew.
-    public bool Frame(Gpu gpu, bool desktopChanged)
+    // Moves and redraws the ring if the window moved, or if the desktop changed
+    // somewhere under the ring. Returns true if it drew.
+    public bool Visible => visible;
+    public Native.RECT Area { get; private set; }
+
+    public bool Frame(Gpu gpu, HashSet<Native.RECT> ringAreas)
     {
         var desktop = gpu.DesktopFor(terminal);
         if (desktop?.View == null || !ShouldShow(out var rect))
@@ -473,15 +574,18 @@ sealed class Ring : NativeWindow, IDisposable
             Hide();
             return false;
         }
-        bool moved = !rect.Equals(lastRect);
-        if (!moved && !desktopChanged && visible)
-            return false;
-        lastRect = rect;
 
         float scale = Native.GetDpiForWindow(terminal) / 96f;
         int margin = (int)MathF.Ceiling(Lens.RingWidth * scale);
         int left = rect.Left - margin, top = rect.Top - margin;
         int w = rect.Right - rect.Left + 2 * margin, h = rect.Bottom - rect.Top + 2 * margin;
+
+        // The ring only ever samples the desktop inside its own bounds.
+        var area = new Native.RECT { Left = left, Top = top, Right = left + w, Bottom = top + h };
+        bool moved = !rect.Equals(lastRect);
+        if (!moved && visible && !desktop.ChangedNear(area, rect, ringAreas))
+            return false;        lastRect = rect;
+        Area = area;
 
         if (w != width || h != height)
             Resize(gpu, w, h);
@@ -729,7 +833,13 @@ static class Native
     [StructLayout(LayoutKind.Sequential)]
     struct MSG { public IntPtr Hwnd; public uint Message; public IntPtr WParam, LParam; public uint Time; public int X, Y; }
 
+    public const uint EVENT_OBJECT_LOCATIONCHANGE = 0x800B;
+    public const uint WINEVENT_OUTOFCONTEXT = 0x0, WINEVENT_SKIPOWNPROCESS = 0x2;
+    public const int OBJID_WINDOW = 0;
+    const uint QS_ALLINPUT = 0x04FF;
+
     public delegate bool EnumWindowsProc(IntPtr hwnd, IntPtr lParam);
+    public delegate void WinEventProc(IntPtr hook, uint ev, IntPtr hwnd, int idObject, int idChild, uint thread, uint time);
 
     [DllImport("user32.dll")] public static extern bool EnumWindows(EnumWindowsProc proc, IntPtr lParam);
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern int GetClassName(IntPtr hwnd, char[] name, int max);
@@ -745,6 +855,11 @@ static class Native
     [DllImport("user32.dll")] static extern bool PeekMessage(out MSG msg, IntPtr hwnd, uint min, uint max, uint remove);
     [DllImport("user32.dll")] static extern bool TranslateMessage(ref MSG msg);
     [DllImport("user32.dll")] static extern IntPtr DispatchMessage(ref MSG msg);
+    [DllImport("user32.dll")]
+    static extern uint MsgWaitForMultipleObjects(uint count, IntPtr handles, bool waitAll, uint ms, uint wakeMask);
+    [DllImport("user32.dll")]
+    public static extern IntPtr SetWinEventHook(uint min, uint max, IntPtr module, WinEventProc proc, uint pid, uint tid, uint flags);
+    [DllImport("user32.dll")] public static extern bool UnhookWinEvent(IntPtr hook);
     [DllImport("dwmapi.dll")] public static extern int DwmFlush();
     [DllImport("dwmapi.dll")] public static extern int DwmGetWindowAttribute(IntPtr hwnd, int attr, out RECT value, int size);
     [DllImport("dwmapi.dll")] public static extern int DwmGetWindowAttribute(IntPtr hwnd, int attr, out int value, int size);
@@ -755,6 +870,9 @@ static class Native
         int length = GetClassName(hwnd, buffer, buffer.Length);
         return new string(buffer, 0, length);
     }
+
+    // Waits up to `ms` for this thread to get a message (a hook event, say).
+    public static void WaitForMessages(uint ms) => MsgWaitForMultipleObjects(0, IntPtr.Zero, false, ms, QS_ALLINPUT);
 
     public static void PumpMessages()
     {

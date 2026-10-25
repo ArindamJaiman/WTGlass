@@ -1,0 +1,77 @@
+// The Windows Terminal settings that go with the Liquid Glass shader.
+// Merge these into your settings.json (Settings > Open JSON file).
+// Replace the shader path with wherever you put shader/liquid-glass.hlsl.
+{
+    "compatibility.enableUnfocusedAcrylic": true,
+    "useAcrylicInTabRow": false,
+    "theme": "Liquid Glass",
+
+    "profiles":
+    {
+        "defaults":
+        {
+            "colorScheme": "Liquid Glass",
+            "experimental.pixelShaderPath": "C:\\path\\to\\WTGlass\\shader\\liquid-glass.hlsl",
+            "opacity": 50,
+            "padding": "0",
+            "scrollbarState": "hidden",
+            "useAcrylic": true
+        }
+    },
+
+    "schemes":
+    [
+        {
+            "name": "Liquid Glass",
+            "background": "#10141C",
+            "foreground": "#F2F4F8",
+            "cursorColor": "#FFFFFF",
+            "selectionBackground": "#4A7FC1",
+            "black": "#1C2028",
+            "red": "#FF453A",
+            "green": "#30D158",
+            "yellow": "#FFD60A",
+            "blue": "#0A84FF",
+            "purple": "#BF5AF2",
+            "cyan": "#64D2FF",
+            "white": "#D7DCE4",
+            "brightBlack": "#6E7480",
+            "brightRed": "#FF6961",
+            "brightGreen": "#30DB5B",
+            "brightYellow": "#FFD426",
+            "brightBlue": "#409CFF",
+            "brightPurple": "#DA8FFF",
+            "brightCyan": "#70D7FF",
+            "brightWhite": "#FFFFFF"
+        }
+    ],
+
+    "themes":
+    [
+        {
+            "name": "Liquid Glass",
+            "tab":
+            {
+                "background": "#FFFFFF1F",
+                "iconStyle": "default",
+                "showCloseButton": "hover",
+                "unfocusedBackground": "#FFFFFF0D"
+            },
+            // terminalBackground reuses the terminal's own acrylic brush, so the tab
+            // bar is exactly as see-through as the body. (useAcrylicInTabRow would
+            // give it a separate acrylic layer fixed at 50% tint, which looks darker.)
+            "tabRow":
+            {
+                "background": "terminalBackground",
+                "unfocusedBackground": "terminalBackground"
+            },
+            "window":
+            {
+                "applicationTheme": "dark",
+                "frame": "#8D99AE",
+                "unfocusedFrame": "#3A404C",
+                "useMica": false
+            }
+        }
+    ]
+}

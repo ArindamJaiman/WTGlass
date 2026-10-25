@@ -202,6 +202,16 @@ sealed class Renderer
                     Scan(gpu, rings);
                 }
 
+                // Nothing to draw (no terminal, or all minimized, maximized or on
+                // another virtual desktop): check twice a second instead of every refresh.
+                if (!rings.Values.Any(r => r.CanShow()))
+                {
+                    foreach (var ring in rings.Values)
+                        ring.Hide();
+                    Thread.Sleep(500);
+                    continue;
+                }
+
                 bool desktopChanged = gpu.Desktops.Aggregate(false, (any, d) => d.Refresh(gpu) | any);
                 foreach (var ring in rings.Values)
                     if (ring.Frame(gpu, desktopChanged))
@@ -549,6 +559,8 @@ sealed class Ring : NativeWindow, IDisposable
         width = w;
         height = h;
     }
+
+    public bool CanShow() => ShouldShow(out _);
 
     // Visible, on this virtual desktop, and not minimized, maximized or fullscreen.
     bool ShouldShow(out Native.RECT rect)

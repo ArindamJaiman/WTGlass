@@ -14,6 +14,7 @@
 //
 // Flags:
 //   --preset high|medium|low   use this preset for this run (the tray menu's choice is saved)
+//   --autostart on|off         same as the tray's Start with Windows, then exit
 //
 // Debugging flags:
 //   --dump <folder>   save each ring's latest frame there
@@ -101,6 +102,11 @@ static class Program
         StatsFile = Arg("--stats");
         TestPattern = args.Contains("--test-pattern");
         StartPreset = Arg("--preset") is string preset ? Preset.Find(preset) : Preset.Load();
+        if (Arg("--autostart") is string autostart)
+        {
+            TrayContext.SetStartsWithWindows(autostart == "on");
+            return;
+        }
 
         using var mutex = new Mutex(true, "TerminalSpaceWarp.SingleInstance", out var first);
         if (!first)
@@ -114,8 +120,16 @@ static class Program
 // The tray icon. All the rendering happens on its own thread (Renderer).
 sealed class TrayContext : ApplicationContext
 {
-    const string RunKey = @"Software\Microsoft\Windows\CurrentVersion\Run";
-    const string RunValue = "TerminalSpaceWarp";
+    // Autostart is a shortcut in the Startup folder, so Task Manager lists it as
+    // "Terminal Space Warp". Task Manager records Enabled/Disabled for it under
+    // StartupApproved; the app only ever changes either when you use the menu.
+    const string ShortcutName = "Terminal Space Warp.lnk";
+    const string ApprovedKey = @"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\StartupFolder";
+    // Where autostart used to live; cleared when you switch autostart on or off.
+    const string OldRunKey = @"Software\Microsoft\Windows\CurrentVersion\Run";
+    const string OldRunValue = "TerminalSpaceWarp";
+
+    static string ShortcutPath => Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Startup), ShortcutName);
 
     readonly NotifyIcon tray;
     readonly Renderer renderer = new();
@@ -152,19 +166,47 @@ sealed class TrayContext : ApplicationContext
         renderer.Start();
     }
 
+    // On only if the shortcut exists and Task Manager hasn't disabled it
+    // (an odd first byte in its StartupApproved value means disabled).
     static bool StartsWithWindows()
     {
-        using var key = Registry.CurrentUser.OpenSubKey(RunKey);
-        return key?.GetValue(RunValue) is string;
+        if (!File.Exists(ShortcutPath))
+            return false;
+        using var key = Registry.CurrentUser.OpenSubKey(ApprovedKey);
+        return key?.GetValue(ShortcutName) is not byte[] state || state.Length == 0 || (state[0] & 1) == 0;
     }
 
-    static void SetStartsWithWindows(bool enable)
+    public static void SetStartsWithWindows(bool enable)
     {
-        using var key = Registry.CurrentUser.CreateSubKey(RunKey);
+        using (var old = Registry.CurrentUser.OpenSubKey(OldRunKey, writable: true))
+            old?.DeleteValue(OldRunValue, throwOnMissingValue: false);
+        // Clearing Task Manager's record re-enables an entry it had disabled,
+        // instead of adding a second one.
+        using (var approved = Registry.CurrentUser.OpenSubKey(ApprovedKey, writable: true))
+            approved?.DeleteValue(ShortcutName, throwOnMissingValue: false);
+
         if (enable)
-            key.SetValue(RunValue, $"\"{Environment.ProcessPath}\"");
+            CreateShortcut(ShortcutPath, Environment.ProcessPath!);
         else
-            key.DeleteValue(RunValue, throwOnMissingValue: false);
+            File.Delete(ShortcutPath);
+    }
+
+    static void CreateShortcut(string path, string target)
+    {
+        var shellType = Type.GetTypeFromProgID("WScript.Shell")!;
+        dynamic shell = Activator.CreateInstance(shellType)!;
+        try
+        {
+            dynamic shortcut = shell.CreateShortcut(path);
+            shortcut.TargetPath = target;
+            shortcut.WorkingDirectory = Path.GetDirectoryName(target);
+            shortcut.Description = "Bends the desktop around Windows Terminal windows";
+            shortcut.Save();
+        }
+        finally
+        {
+            Marshal.FinalReleaseComObject(shell);
+        }
     }
 
     // A small ring of light, drawn rather than shipped as a file.

@@ -89,6 +89,10 @@ Things to know:
 - It hides itself when a terminal is maximized, fullscreen or minimized.
 - With no terminal on screen it checks only twice a second (about 0.01% CPU), whatever
   the preset.
+- **Start with Windows** puts a `Terminal Space Warp` shortcut in your Startup folder, so
+  that's the name Task Manager's Startup apps shows. If you disable it there, it stays
+  disabled: the app never adds or re-enables an entry on its own, only when you switch
+  Start with Windows on (or run `TerminalSpaceWarp.exe --autostart on`; `off` removes it).
 - Windows only hands over the previous desktop frame, so a very fast drag can briefly
   smear the terminal onto the trailing edge.
 - Debug flags: `--test-pattern` (a flat magenta ring screenshots can see),
